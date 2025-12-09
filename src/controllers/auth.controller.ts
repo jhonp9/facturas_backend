@@ -1,45 +1,44 @@
-// server/src/controllers/auth.controller.js
-const { PrismaClient } = require('@prisma/client');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { enviarCodigoVerificacion } = require('../utils/mailer');
+import { Request, Response } from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { enviarCodigoVerificacion } from '../utils/mailer';
 
-const prisma = new PrismaClient();
+import prisma from '../config/prisma';
 
 // 1. REGISTRO
-exports.register = async (req, res) => {
+export const register = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Datos vienen de FormData (req.body y req.file)
     const { nombreUsuario, emailContacto, passwordAdmin, passwordVendedor } = req.body;
-    const logoFile = req.file; // Archivo de imagen
+    const logoFile = req.file; // Express.Multer.File | undefined
 
-    // Validaciones básicas
-    if (!logoFile) return res.status(400).json({ error: "El logo de la empresa es obligatorio" });
-    if (!nombreUsuario || !emailContacto) return res.status(400).json({ error: "Faltan datos obligatorios" });
-
-    // Validar si el nombre de usuario (empresa) ya existe
-    const existe = await prisma.empresa.findUnique({ where: { nombreUsuario } });
-    if (existe) {
-      return res.status(400).json({ error: "Este nombre de usuario/empresa ya está registrado" });
+    if (!logoFile) {
+      res.status(400).json({ error: "El logo de la empresa es obligatorio" });
+      return;
+    }
+    if (!nombreUsuario || !emailContacto) {
+      res.status(400).json({ error: "Faltan datos obligatorios" });
+      return;
     }
 
-    // Generar Emails automáticos
+    const existe = await prisma.empresa.findUnique({ where: { nombreUsuario } });
+    if (existe) {
+      res.status(400).json({ error: "Este nombre de usuario/empresa ya está registrado" });
+      return;
+    }
+
     const emailAdmin = `administrador@${nombreUsuario}.com`.toLowerCase();
     const emailVendedor = `vendedor@${nombreUsuario}.com`.toLowerCase();
 
-    // Encriptar contraseñas
     const hashAdmin = await bcrypt.hash(passwordAdmin, 10);
     const hashVendedor = await bcrypt.hash(passwordVendedor, 10);
 
-    // Generar código de 6 dígitos
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // --- TRANSACCIÓN: Crear todo junto en la BD ---
     const nuevaEmpresa = await prisma.empresa.create({
       data: {
         nombreUsuario,
         emailContacto,
-        logoUrl: logoFile.filename, // Guardamos solo el nombre del archivo
+        logoUrl: logoFile.filename,
         codigoVerificacion: codigo,
         verificado: false,
         usuarios: {
@@ -51,8 +50,7 @@ exports.register = async (req, res) => {
       }
     });
 
-    // Enviar correo (async, no bloqueamos la respuesta)
-    enviarCodigoVerificacion(emailContacto, codigo);
+    await enviarCodigoVerificacion(emailContacto, codigo);
 
     res.status(201).json({ 
       message: "Registro iniciado. Verifique su correo.", 
@@ -65,27 +63,29 @@ exports.register = async (req, res) => {
   }
 };
 
-// 2. VERIFICACIÓN DE CÓDIGO
-exports.verify = async (req, res) => {
+// 2. VERIFICACIÓN
+export const verify = async (req: Request, res: Response): Promise<void> => {
   try {
     const { empresaId, codigo } = req.body;
 
-    const empresa = await prisma.empresa.findUnique({ where: { id: parseInt(empresaId) } });
+    // ParseInt porque los params o body a veces vienen como strings
+    const id = parseInt(empresaId);
 
-    if (!empresa) return res.status(404).json({ error: "Empresa no encontrada" });
+    const empresa = await prisma.empresa.findUnique({ where: { id } });
+
+    if (!empresa) {
+       res.status(404).json({ error: "Empresa no encontrada" });
+       return;
+    }
     
-    // Verificar si el código coincide
     if (empresa.codigoVerificacion !== codigo) {
-      return res.status(400).json({ error: "El código ingresado es incorrecto" });
+       res.status(400).json({ error: "El código ingresado es incorrecto" });
+       return;
     }
 
-    // Activar empresa y limpiar código
     await prisma.empresa.update({
-      where: { id: parseInt(empresaId) },
-      data: { 
-        verificado: true, 
-        codigoVerificacion: null 
-      }
+      where: { id },
+      data: { verificado: true, codigoVerificacion: null }
     });
 
     res.json({ message: "Cuenta verificada correctamente" });
@@ -97,31 +97,37 @@ exports.verify = async (req, res) => {
 };
 
 // 3. LOGIN
-exports.login = async (req, res) => {
+export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
 
-    // Buscar usuario incluyendo datos de su empresa
     const usuario = await prisma.usuario.findUnique({
       where: { email },
       include: { empresa: true }
     });
 
-    if (!usuario) return res.status(401).json({ error: "Usuario no encontrado" });
-
-    // Verificar si la empresa está verificada por correo
-    if (!usuario.empresa.verificado) {
-      return res.status(401).json({ error: "La cuenta de la empresa aún no ha sido verificada" });
+    if (!usuario) {
+       res.status(401).json({ error: "Usuario no encontrado" });
+       return;
     }
 
-    // Comparar contraseña
-    const esValida = await bcrypt.compare(password, usuario.password);
-    if (!esValida) return res.status(401).json({ error: "Contraseña incorrecta" });
+    if (!usuario.empresa.verificado) {
+       res.status(401).json({ error: "La cuenta de la empresa aún no ha sido verificada" });
+       return;
+    }
 
-    // Generar Token JWT
+    const esValida = await bcrypt.compare(password, usuario.password);
+    if (!esValida) {
+       res.status(401).json({ error: "Contraseña incorrecta" });
+       return;
+    }
+
+    // Asegúrate de definir JWT_SECRET en tu .env o usa un fallback seguro
+    const secret = process.env.JWT_SECRET || 'secreto_super_seguro';
+    
     const token = jwt.sign(
       { userId: usuario.id, rol: usuario.rol, empresaId: usuario.empresaId },
-      process.env.JWT_SECRET || 'secreto_super_seguro',
+      secret,
       { expiresIn: '8h' }
     );
 
