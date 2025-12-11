@@ -2,43 +2,55 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { enviarCodigoVerificacion } from '../utils/mailer';
-
 import prisma from '../config/prisma';
+import cloudinary from '../config/cloudinary';
 
 // 1. REGISTRO
 export const register = async (req: Request, res: Response): Promise<void> => {
+  let nuevaEmpresaId: number | null = null;
+  
+  // Con multer-storage-cloudinary, req.file.path es la URL pública
+  // y req.file.filename es el public_id (necesario para borrar)
+  const logoUrl = req.file?.path; 
+  const logoPublicId = req.file?.filename;
+
   try {
     const { nombreUsuario, emailContacto, passwordAdmin, passwordVendedor } = req.body;
-    const logoFile = req.file; // Express.Multer.File | undefined
 
-    if (!logoFile) {
+    if (!req.file || !logoUrl) {
       res.status(400).json({ error: "El logo de la empresa es obligatorio" });
       return;
     }
-    if (!nombreUsuario || !emailContacto) {
-      res.status(400).json({ error: "Faltan datos obligatorios" });
+
+    if (!nombreUsuario || !emailContacto || !passwordAdmin || !passwordVendedor) {
+      // Si faltan datos, borramos la imagen que se acaba de subir a Cloudinary
+      if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
+      res.status(400).json({ error: "Todos los campos son obligatorios" });
       return;
     }
 
+    // 1. Verificar duplicados
     const existe = await prisma.empresa.findUnique({ where: { nombreUsuario } });
     if (existe) {
+      // Borramos imagen de Cloudinary porque el usuario ya existe
+      if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
       res.status(400).json({ error: "Este nombre de usuario/empresa ya está registrado" });
       return;
     }
 
     const emailAdmin = `administrador@${nombreUsuario}.com`.toLowerCase();
     const emailVendedor = `vendedor@${nombreUsuario}.com`.toLowerCase();
-
     const hashAdmin = await bcrypt.hash(passwordAdmin, 10);
     const hashVendedor = await bcrypt.hash(passwordVendedor, 10);
-
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
 
+    // 2. Crear empresa y usuarios en DB
+    // GUARDAMOS LA URL COMPLETA DE CLOUDINARY EN `logoUrl`
     const nuevaEmpresa = await prisma.empresa.create({
       data: {
         nombreUsuario,
         emailContacto,
-        logoUrl: logoFile.filename,
+        logoUrl: logoUrl, // Ahora esto es una URL https://res.cloudinary...
         codigoVerificacion: codigo,
         verificado: false,
         usuarios: {
@@ -49,8 +61,26 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         }
       }
     });
+    
+    nuevaEmpresaId = nuevaEmpresa.id;
 
-    await enviarCodigoVerificacion(emailContacto, codigo);
+    // 3. Intentar enviar correo
+    try {
+        await enviarCodigoVerificacion(emailContacto, codigo);
+    } catch (emailError) {
+        console.error("Fallo al enviar correo:", emailError);
+        
+        // ROLLBACK: Borramos DB y la imagen en Cloudinary
+        await prisma.usuario.deleteMany({ where: { empresaId: nuevaEmpresa.id } });
+        await prisma.empresa.delete({ where: { id: nuevaEmpresa.id } });
+        
+        if (logoPublicId) {
+            await cloudinary.uploader.destroy(logoPublicId);
+        }
+
+        res.status(500).json({ error: "No se pudo enviar el correo. Intenta de nuevo." });
+        return;
+    }
 
     res.status(201).json({ 
       message: "Registro iniciado. Verifique su correo.", 
@@ -59,6 +89,10 @@ export const register = async (req: Request, res: Response): Promise<void> => {
 
   } catch (error) {
     console.error(error);
+    // Limpieza de emergencia en Cloudinary
+    if (req.file && req.file.filename) {
+        await cloudinary.uploader.destroy(req.file.filename);
+    }
     res.status(500).json({ error: "Error interno del servidor al registrar" });
   }
 };
