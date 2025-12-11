@@ -1,6 +1,7 @@
 // backend/src/routes/auth.routes.ts
 import { Router } from 'express';
 import { 
+  searchRuc,
   register, 
   verify, 
   login, 
@@ -10,11 +11,14 @@ import {
 } from '../controllers/auth.controller';
 import upload from '../middlewares/upload';
 
+
 const router = Router();
 
 router.post('/register', upload.single('logo'), register);
 router.post('/verify', verify);
 router.post('/login', login);
+router.post('/search-ruc', searchRuc); // Nueva ruta
+router.post('/register', upload.single('logo'), register);
 
 // Rutas de recuperación
 router.post('/forgot-password', requestPasswordReset);

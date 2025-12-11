@@ -4,58 +4,148 @@ import jwt from 'jsonwebtoken';
 import prisma from '../config/prisma';
 import cloudinary from '../config/cloudinary';
 import { enviarCodigoVerificacion, enviarCodigoRecuperacion } from '../utils/mailer';
+import { consultarRucSunat } from '../services/sunat.service';
+
+// 0. NUEVO: Endpoint para consultar RUC desde el frontend
+export const searchRuc = async (req: Request, res: Response): Promise<void> => {
+  const { ruc } = req.body;
+  if (!ruc || ruc.length !== 11) {
+    res.status(400).json({ error: "El RUC debe tener 11 dígitos" });
+    return;
+  }
+
+  try {
+    const existe = await prisma.empresa.findUnique({ where: { ruc } });
+    if (existe) {
+      res.status(400).json({ error: "Este RUC ya está registrado." });
+      return;
+    }
+
+    const datos = await consultarRucSunat(ruc);
+    
+    if (!datos) {
+      res.status(404).json({ error: "No se encontraron datos." });
+      return;
+    }
+
+    // --- MODIFICACIÓN: Buscamos el nombre en múltiples variantes ---
+    const nombreEncontrado = 
+        datos.razonSocial || 
+        datos.nombre || 
+        datos.razon_social || 
+        datos.ddp_nombre || // Campo raw de SUNAT
+        datos.desc_nombre || 
+        "";
+
+    const direccionEncontrada = 
+        datos.direccion || 
+        datos.direccionCompleta || 
+        datos.domicilio_fiscal || 
+        datos.domicilioFiscal || 
+        "";
+    // ---------------------------------------------------------------
+
+    const respuestaFrontend = {
+        ruc: datos.ruc || datos.numeroDocumento || ruc,
+        razonSocial: nombreEncontrado,
+        direccion: direccionEncontrada,
+        estado: datos.estado,
+        condicion: datos.condicion
+    };
+
+    res.json(respuestaFrontend);
+
+  } catch (error) {
+    console.error("Error searchRuc:", error);
+    res.status(500).json({ error: "Error interno" });
+  }
+};
 
 // 1. REGISTRO
 export const register = async (req: Request, res: Response): Promise<void> => {
-  let nuevaEmpresaId: number | null = null;
-  
   const logoUrl = req.file?.path; 
   const logoPublicId = req.file?.filename;
 
   try {
-    const { nombreUsuario, emailContacto, passwordAdmin, passwordVendedor } = req.body;
+    const { 
+      ruc,
+      nombreUsuario, // <--- NUEVO CAMPO RECIBIDO
+      razonSocial, 
+      direccion, 
+      telefonos, 
+      emailContacto, 
+      passwordAdmin, 
+      passwordVendedor 
+    } = req.body;
 
     if (!req.file || !logoUrl) {
-      res.status(400).json({ error: "El logo de la empresa es obligatorio" });
+      res.status(400).json({ error: "El logo es obligatorio" });
       return;
     }
 
-    if (!nombreUsuario || !emailContacto || !passwordAdmin || !passwordVendedor) {
+    // Validaciones
+    if (!ruc || !nombreUsuario || !razonSocial || !emailContacto) {
+       if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
+       res.status(400).json({ error: "Faltan datos obligatorios (RUC, Usuario, Razón Social)" });
+       return;
+    }
+
+    // 1. Verificar duplicado de RUC
+    const existeRuc = await prisma.empresa.findUnique({ where: { ruc } });
+    if (existeRuc) {
       if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
-      res.status(400).json({ error: "Todos los campos son obligatorios" });
+      res.status(400).json({ error: "El RUC ya está registrado." });
       return;
     }
 
-    // 1. Verificar duplicados (Nombre de Empresa)
-    const existeNombre = await prisma.empresa.findUnique({ where: { nombreUsuario } });
-    if (existeNombre) {
+    // 2. Verificar duplicado de NOMBRE DE USUARIO (Nuevo)
+    const existeUsuario = await prisma.empresa.findUnique({ where: { nombreUsuario } });
+    if (existeUsuario) {
       if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
-      res.status(400).json({ error: "Este nombre de empresa ya está registrado" });
+      res.status(400).json({ error: "El nombre de usuario ya existe. Por favor elige otro." });
       return;
     }
 
-    // 1.5. Verificar duplicados (Email de Contacto) - ¡NUEVA VALIDACIÓN!
+    // 3. Verificar duplicado de Email de Contacto
     const existeEmail = await prisma.empresa.findFirst({ where: { emailContacto } });
     if (existeEmail) {
       if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
-      res.status(400).json({ error: "Ya existe una empresa registrada con este correo electrónico." });
+      res.status(400).json({ error: "El correo de contacto ya está registrado." });
       return;
     }
 
-    const emailAdmin = `administrador@${nombreUsuario}.com`.toLowerCase();
-    const emailVendedor = `vendedor@${nombreUsuario}.com`.toLowerCase();
+    // Parsear teléfonos
+    let telefonosArray: string[] = [];
+    try {
+      telefonosArray = typeof telefonos === 'string' ? JSON.parse(telefonos) : telefonos;
+    } catch (e) { telefonosArray = []; }
+
+    // --- GENERACIÓN DE CORREOS CON NOMBRE DE USUARIO ---
+    // Usamos toLowerCase() para evitar problemas con mayúsculas
+    const usuarioLimpio = nombreUsuario.trim().toLowerCase();
+    const emailAdmin = `administrador@${usuarioLimpio}.com`;
+    const emailVendedor = `vendedor@${usuarioLimpio}.com`;
+    // ----------------------------------------------------
+
     const hashAdmin = await bcrypt.hash(passwordAdmin, 10);
     const hashVendedor = await bcrypt.hash(passwordVendedor, 10);
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
 
-    // 2. Crear empresa y usuarios en DB
+    // Crear Empresa
     const nuevaEmpresa = await prisma.empresa.create({
       data: {
-        nombreUsuario,
+        ruc,
+        nombreUsuario: usuarioLimpio, // Guardamos el nombre de usuario
+        razonSocial,
+        direccion: direccion || '',
+        nombreComercial: razonSocial,
         emailContacto,
-        logoUrl: logoUrl,
+        logoUrl,
         codigoVerificacion: codigo,
         verificado: false,
+        telefonos: {
+          create: telefonosArray.map((tel) => ({ numero: tel }))
+        },
         usuarios: {
           create: [
             { email: emailAdmin, password: hashAdmin, rol: "ADMIN" },
@@ -64,38 +154,30 @@ export const register = async (req: Request, res: Response): Promise<void> => {
         }
       }
     });
-    
-    nuevaEmpresaId = nuevaEmpresa.id;
 
-    // 3. Intentar enviar correo
+    // Enviar correo
     try {
         await enviarCodigoVerificacion(emailContacto, codigo);
     } catch (emailError) {
-        console.error("Fallo al enviar correo:", emailError);
-        
-        // ROLLBACK
+        // Rollback
+        await prisma.telefono.deleteMany({ where: { empresaId: nuevaEmpresa.id }});
         await prisma.usuario.deleteMany({ where: { empresaId: nuevaEmpresa.id } });
         await prisma.empresa.delete({ where: { id: nuevaEmpresa.id } });
+        if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
         
-        if (logoPublicId) {
-            await cloudinary.uploader.destroy(logoPublicId);
-        }
-
-        res.status(500).json({ error: "No se pudo enviar el correo. Intenta de nuevo." });
+        res.status(500).json({ error: "No se pudo enviar el correo de verificación." });
         return;
     }
 
     res.status(201).json({ 
-      message: "Registro iniciado. Verifique su correo.", 
+      message: "Registro exitoso. Verifique su correo.", 
       empresaId: nuevaEmpresa.id 
     });
 
   } catch (error) {
     console.error(error);
-    if (logoPublicId) {
-        await cloudinary.uploader.destroy(logoPublicId);
-    }
-    res.status(500).json({ error: "Error interno del servidor al registrar" });
+    if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 };
 
@@ -132,7 +214,7 @@ export const verify = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
-// 3. LOGIN
+// 3. LOGIN (Actualizado)
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
     const { email, password } = req.body;
@@ -158,7 +240,6 @@ export const login = async (req: Request, res: Response): Promise<void> => {
        return;
     }
 
-    // Asegúrate de definir JWT_SECRET en tu .env o usa un fallback seguro
     const secret = process.env.JWT_SECRET || 'secreto_super_seguro';
     
     const token = jwt.sign(
@@ -174,6 +255,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         email: usuario.email,
         rol: usuario.rol,
         nombreUsuario: usuario.empresa.nombreUsuario,
+        ruc: usuario.empresa.ruc,           
+        razonSocial: usuario.empresa.razonSocial, 
         logo: usuario.empresa.logoUrl
       }
     });

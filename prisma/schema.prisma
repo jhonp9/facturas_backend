@@ -8,21 +8,36 @@ datasource db {
 }
 
 model Empresa {
-  id              Int       @id @default(autoincrement())
-  nombreUsuario   String    @unique // El identificador único
-  emailContacto   String // El correo gmail/hotmail del dueño
-  logoUrl         String
+  id                 Int        @id @default(autoincrement())
+  ruc                String     @unique // Nuevo: RUC obligatorio y único
+  nombreUsuario      String     @unique
+  razonSocial        String     // Nuevo: Nombre oficial de SUNAT
+  nombreComercial    String?    // El nombre "usuario" o "marca"
+  direccion          String?    // Nuevo: Dirección fiscal
+  emailContacto      String     // Correo del dueño
+  logoUrl            String
+  
+  // Relación con teléfonos (1 a muchos)
+  telefonos          Telefono[] 
+  
+  usuarios           Usuario[]
   codigoVerificacion String?
-  verificado      Boolean   @default(false)
-  usuarios        Usuario[]
-  createdAt       DateTime  @default(now())
+  verificado         Boolean    @default(false)
+  createdAt          DateTime   @default(now())
+}
+
+model Telefono {
+  id        Int     @id @default(autoincrement())
+  numero    String
+  empresaId Int
+  empresa   Empresa @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 }
 
 model Usuario {
   id        Int      @id @default(autoincrement())
-  email     String   @unique // admin@nombreusuario.com
+  email     String   @unique 
   password  String
   rol       String   // "ADMIN" o "VENDEDOR"
   empresaId Int
-  empresa   Empresa  @relation(fields: [empresaId], references: [id])
+  empresa   Empresa  @relation(fields: [empresaId], references: [id], onDelete: Cascade)
 }
