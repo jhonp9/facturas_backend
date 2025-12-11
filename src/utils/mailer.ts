@@ -1,17 +1,22 @@
 import nodemailer from 'nodemailer';
+import dotenv from 'dotenv'; // <--- 1. Importar dotenv
+
+// 2. Cargar la configuración aquí mismo para asegurar que las variables existan
+// antes de crear el transporter.
+dotenv.config(); 
 
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: 'yhon99676@gmail.com', // Tu correo
-    pass: process.env.EMAIL_PASSWORD // Tu contraseña de aplicación
+    user: 'yhon99676@gmail.com',
+    pass: process.env.EMAIL_PASSWORD // Ahora esto sí tendrá el valor del .env
   }
 });
 
 export const enviarCodigoVerificacion = async (email: string, codigo: string): Promise<void> => {
-  // Eliminamos el try/catch aquí para que el error suba al controlador
+  // No usamos try/catch aquí para que el error suba al controlador si falla
   await transporter.sendMail({
-    from: '"Sistema Facturación JP" <yohn99676@gmail.com>',
+    from: '"Sistema Facturación JP" <yhon99676@gmail.com>',
     to: email,
     subject: 'Verifica tu cuenta de empresa',
     html: `
@@ -29,4 +34,25 @@ export const enviarCodigoVerificacion = async (email: string, codigo: string): P
     `
   });
   console.log(`✅ Correo enviado a ${email}`);
+};
+export const enviarCodigoRecuperacion = async (email: string, codigo: string): Promise<void> => {
+  await transporter.sendMail({
+    from: '"Sistema Facturación JP" <yhon99676@gmail.com>',
+    to: email,
+    subject: 'Recuperación de Contraseña',
+    html: `
+      <div style="font-family: sans-serif; max-w-600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 10px;">
+        <h2 style="color: #DC2626; text-align: center;">Recuperar Acceso</h2>
+        <p>Hemos recibido una solicitud para cambiar la contraseña de tu empresa.</p>
+        <p>Usa el siguiente código para verificar tu identidad:</p>
+        
+        <div style="background-color: #fef2f2; padding: 15px; text-align: center; font-size: 28px; font-weight: bold; color: #991b1b; letter-spacing: 4px; margin: 20px 0;">
+          ${codigo}
+        </div>
+        
+        <p style="font-size: 12px; color: #666;">Si no solicitaste esto, por favor contacta al soporte inmediatamente.</p>
+      </div>
+    `
+  });
+  console.log(`✅ Correo de recuperación enviado a ${email}`);
 };

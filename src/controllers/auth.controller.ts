@@ -1,16 +1,14 @@
 import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { enviarCodigoVerificacion } from '../utils/mailer';
 import prisma from '../config/prisma';
 import cloudinary from '../config/cloudinary';
+import { enviarCodigoVerificacion, enviarCodigoRecuperacion } from '../utils/mailer';
 
 // 1. REGISTRO
 export const register = async (req: Request, res: Response): Promise<void> => {
   let nuevaEmpresaId: number | null = null;
   
-  // Con multer-storage-cloudinary, req.file.path es la URL pública
-  // y req.file.filename es el public_id (necesario para borrar)
   const logoUrl = req.file?.path; 
   const logoPublicId = req.file?.filename;
 
@@ -23,18 +21,24 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     }
 
     if (!nombreUsuario || !emailContacto || !passwordAdmin || !passwordVendedor) {
-      // Si faltan datos, borramos la imagen que se acaba de subir a Cloudinary
       if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
       res.status(400).json({ error: "Todos los campos son obligatorios" });
       return;
     }
 
-    // 1. Verificar duplicados
-    const existe = await prisma.empresa.findUnique({ where: { nombreUsuario } });
-    if (existe) {
-      // Borramos imagen de Cloudinary porque el usuario ya existe
+    // 1. Verificar duplicados (Nombre de Empresa)
+    const existeNombre = await prisma.empresa.findUnique({ where: { nombreUsuario } });
+    if (existeNombre) {
       if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
-      res.status(400).json({ error: "Este nombre de usuario/empresa ya está registrado" });
+      res.status(400).json({ error: "Este nombre de empresa ya está registrado" });
+      return;
+    }
+
+    // 1.5. Verificar duplicados (Email de Contacto) - ¡NUEVA VALIDACIÓN!
+    const existeEmail = await prisma.empresa.findFirst({ where: { emailContacto } });
+    if (existeEmail) {
+      if (logoPublicId) await cloudinary.uploader.destroy(logoPublicId);
+      res.status(400).json({ error: "Ya existe una empresa registrada con este correo electrónico." });
       return;
     }
 
@@ -45,12 +49,11 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
 
     // 2. Crear empresa y usuarios en DB
-    // GUARDAMOS LA URL COMPLETA DE CLOUDINARY EN `logoUrl`
     const nuevaEmpresa = await prisma.empresa.create({
       data: {
         nombreUsuario,
         emailContacto,
-        logoUrl: logoUrl, // Ahora esto es una URL https://res.cloudinary...
+        logoUrl: logoUrl,
         codigoVerificacion: codigo,
         verificado: false,
         usuarios: {
@@ -70,7 +73,7 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     } catch (emailError) {
         console.error("Fallo al enviar correo:", emailError);
         
-        // ROLLBACK: Borramos DB y la imagen en Cloudinary
+        // ROLLBACK
         await prisma.usuario.deleteMany({ where: { empresaId: nuevaEmpresa.id } });
         await prisma.empresa.delete({ where: { id: nuevaEmpresa.id } });
         
@@ -89,9 +92,8 @@ export const register = async (req: Request, res: Response): Promise<void> => {
 
   } catch (error) {
     console.error(error);
-    // Limpieza de emergencia en Cloudinary
-    if (req.file && req.file.filename) {
-        await cloudinary.uploader.destroy(req.file.filename);
+    if (logoPublicId) {
+        await cloudinary.uploader.destroy(logoPublicId);
     }
     res.status(500).json({ error: "Error interno del servidor al registrar" });
   }
@@ -179,5 +181,107 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Error en el servidor" });
+  }
+};
+// 4. SOLICITAR RECUPERACIÓN (Paso 1)
+export const requestPasswordReset = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email } = req.body;
+
+    // Buscamos la empresa por su correo de contacto
+    const empresa = await prisma.empresa.findFirst({
+      where: { emailContacto: email }
+    });
+
+    if (!empresa) {
+      // Por seguridad, no decimos si el correo existe o no, pero aquí para desarrollo devolvemos error
+      res.status(404).json({ error: "No existe una empresa registrada con este correo." });
+      return;
+    }
+
+    // Generar código
+    const codigo = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Guardamos el código en la empresa (reutilizamos el campo codigoVerificacion)
+    await prisma.empresa.update({
+      where: { id: empresa.id },
+      data: { codigoVerificacion: codigo }
+    });
+
+    await enviarCodigoRecuperacion(email, codigo);
+
+    res.json({ message: "Código enviado", empresaId: empresa.id });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Error al solicitar recuperación" });
+  }
+};
+
+// 5. VERIFICAR CÓDIGO DE RECUPERACIÓN (Paso 2)
+export const verifyResetCode = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { empresaId, codigo } = req.body;
+    const id = parseInt(empresaId);
+
+    const empresa = await prisma.empresa.findUnique({ where: { id } });
+
+    if (!empresa || empresa.codigoVerificacion !== codigo) {
+      res.status(400).json({ error: "Código incorrecto o expirado" });
+      return;
+    }
+
+    res.json({ message: "Código válido" });
+  } catch (error) {
+    res.status(500).json({ error: "Error de servidor" });
+  }
+};
+
+// 6. CAMBIAR CONTRASEÑA (Paso 3)
+export const resetPassword = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { empresaId, codigo, targetRol, newPassword } = req.body;
+    // targetRol debe ser "ADMIN" o "VENDEDOR"
+
+    const id = parseInt(empresaId);
+    const empresa = await prisma.empresa.findUnique({ 
+        where: { id },
+        include: { usuarios: true } // Traemos los usuarios para buscar el correcto
+    });
+
+    // Verificación final de seguridad
+    if (!empresa || empresa.codigoVerificacion !== codigo) {
+       res.status(400).json({ error: "Operación no autorizada. Código inválido." });
+       return;
+    }
+
+    // Buscar el usuario específico (Admin o Vendedor) de esa empresa
+    const usuarioObjetivo = empresa.usuarios.find(u => u.rol === targetRol);
+
+    if (!usuarioObjetivo) {
+        res.status(404).json({ error: "Usuario no encontrado." });
+        return;
+    }
+
+    // Hashear nueva password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Actualizar password
+    await prisma.usuario.update({
+        where: { id: usuarioObjetivo.id },
+        data: { password: hashedPassword }
+    });
+
+    // Limpiar el código de verificación para que no se pueda reusar
+    await prisma.empresa.update({
+        where: { id },
+        data: { codigoVerificacion: null }
+    });
+
+    res.json({ message: `Contraseña de ${targetRol} actualizada correctamente.` });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Error al actualizar contraseña" });
   }
 };
