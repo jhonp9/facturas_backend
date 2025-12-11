@@ -16,7 +16,7 @@ app.use(cors());
 app.use(express.json());
 
 // Servir estáticos (Imágenes)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 // Rutas
 app.use('/api/auth', authRoutes);
